@@ -2,17 +2,16 @@ use sdl2::pixels::Color;
 use sdl2::event::Event;
 use sdl2::keyboard::Keycode;
 use sdl2::mouse::MouseButton;
-use sdl2::image::InitFlag;
-use sdl2::image::LoadTexture;
+use sdl2::image::{InitFlag, LoadTexture};
 use sdl2::rect::Rect;
-use sdl2::render::TextureQuery;
-use sdl2::render::Canvas;
+use sdl2::render::{TextureQuery, Canvas};
 use sdl2::video::Window;
 use sdl2::ttf;
 use sdl2::ttf::Font;
 use std::thread;
 use std::time::Duration;
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 use rand::prelude::*;
 
 const PLAYER_SIZE_MUL: u32 = 4;
@@ -21,9 +20,12 @@ const SCREEN_WIDTH: u32 = 1000;
 const SCREEN_HEIGHT: u32 = 800;
 const HOLE_HEIGHT: u32 = 200;
 const GROUND_HEIGHT: u32 = 100;
+const JUMP_HEIGHT: i32 = -10;
+const GRAVITY: i32 = 1;
 
 struct Player {
     bounding_box: Rect,
+    y_velocity: i32,
     is_dead: bool,
     frames_falling: u8,
 }
@@ -45,12 +47,20 @@ impl Player {
     fn new(x: i32, y: i32) -> Self {
         Player {
             bounding_box: Rect::new(x, y, 16 * PLAYER_SIZE_MUL, 16 * PLAYER_SIZE_MUL - 4 * PLAYER_SIZE_MUL),
+            y_velocity: JUMP_HEIGHT,
             is_dead: false,
             frames_falling: 0,
         }
     }
 
-    fn draw(&mut self, canvas: &mut Canvas<Window>) -> Result<(), String> {
+    fn update(&mut self) {
+        self.y_velocity += GRAVITY;
+        let y = self.y();
+        let y_velocity = self.y_velocity;
+        self.set_y(y + y_velocity);
+    }
+
+    fn draw(&self, canvas: &mut Canvas<Window>) -> Result<(), String> {
         let texture_creator = canvas.texture_creator();
         let bird = texture_creator.load_texture("bird.png")?;
         canvas.copy(&bird, Some(Rect::new(0, 0, 16, 16)), Some(Rect::new(self.x(), self.y(), self.width(), self.height() + 4 * PLAYER_SIZE_MUL)))?;
@@ -66,12 +76,35 @@ impl Deref for Player {
     }
 }
 
+impl DerefMut for Player {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bounding_box
+    }
+}
+
 impl Pipe {
     fn new(x: i32) -> Self {
         Pipe {
-            bounding_box: Rect::new(x, 0, 64, 700),
+            bounding_box: Rect::new(x, 0, 96, 700),
             hole_y: Self::generate_hole(),
             has_scored: false,
+        }
+    }
+
+    fn update(&mut self, score: &mut u32, player: &mut Player) {
+        self.bounding_box.x -= 2;
+        if player.bounding_box.has_intersection(Rect::new(self.x(), self.hole_y + HOLE_HEIGHT as i32, self.width(), SCREEN_HEIGHT - GROUND_HEIGHT - (self.hole_y as u32 + HOLE_HEIGHT))) || player.bounding_box.has_intersection(Rect::new(self.x(), 0, self.width(), self.hole_y as u32)) {
+            player.is_dead = true;
+            println!("DEAD!");
+        }
+        if !self.has_scored && self.has_intersection(**player) {
+            *score += 1;
+            self.has_scored = true;
+        }
+        if self.x() < -200 {
+            self.bounding_box.x = 1000;
+            self.hole_y = Pipe::generate_hole();
+            self.has_scored = false;
         }
     }
 
@@ -134,10 +167,6 @@ impl<'a, F> Button<'a, F> where F: FnMut() -> () {
     }
 }
 
-fn angle(x: i32) {
-    let slope = x as f64 / 14 + 1 / 7;
-
-
 fn main() -> Result<(), String> {
     let sdl2_context = sdl2::init()?;
     let ttf_context = ttf::init().map_err(|e| e.to_string())?;
@@ -152,30 +181,66 @@ fn main() -> Result<(), String> {
         .build()
         .map_err(|e| e.to_string())?;
     let texture_creator = canvas.texture_creator();
-    let mut score = 0;
+    let mut score = Arc::new(Mutex::new(0));
     let font = ttf_context.load_font("Courier New Bold.ttf", 45)?;
 
     canvas.set_draw_color(Color::RGB(125, 255, 125));
     canvas.clear();
 
-    let mut player = Player::new(200, 400);
+    let mut player = Arc::new(Mutex::new(Player::new(200, 400)));
     let mut frames = 0;
 
-    let mut pipes: Vec<Pipe> = Vec::new();
+    let mut pipes = Arc::new(Mutex::new(Vec::new()));
     for x in 0..3 {
-        pipes.push(Pipe::new(SCREEN_WIDTH as i32 / 2 + x * 400));
+        pipes.lock().unwrap().push(Pipe::new(SCREEN_WIDTH as i32 / 2 + x * 400));
     }
 
     let mut button = Button::new(50, 50, &font, "Click me!", || println!("Clicked!"));
+
     let mut is_jump_key_down = false;
+
+    let player_clone = player.clone();
+    let score_clone = score.clone();
+    let pipes_clone = pipes.clone();
+    thread::spawn(move || {
+        'physics: loop {
+            let mut player = player_clone.lock().unwrap();
+            let mut score = score_clone.lock().unwrap();
+            let mut pipes = pipes_clone.lock().unwrap();
+            player.update();
+            if player.y() > SCREEN_HEIGHT as i32 - GROUND_HEIGHT as i32 - player.height() as i32 {
+                player.is_dead = true;
+                break 'physics;
+            }
+
+            for pipe in pipes.iter_mut() {
+                pipe.update(&mut score, &mut player);
+            }
+
+            player.frames_falling += 1;
+
+            thread::sleep(Duration::from_millis(1000/60));
+        }
+    });
+
+    println!("THREAD SPAWNED!!!!");
+    
+    let player_clone = player.clone();
+    let score_clone = score.clone();
+    let pipes_clone = pipes.clone();
     let mut event_pump = sdl2_context.event_pump()?;
-    'running: loop {
+    'draw: loop {
+        println!("LOOPED");
+        let mut player = player_clone.lock().unwrap();
+        let pipes = pipes_clone.lock().unwrap();
+        let score = score_clone.lock().unwrap();
         while let Some(event) = event_pump.poll_event() {
             match event {
-                Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => break 'running,
+                Event::Quit { .. } | Event::KeyDown { keycode: Some(Keycode::Escape), .. } => break 'draw,
                 Event::KeyDown { keycode: Some(Keycode::Space), .. } if !is_jump_key_down => {
                     player.frames_falling = 0;
                     is_jump_key_down = true;
+                    player.y_velocity = JUMP_HEIGHT;
                 }
                 Event::KeyUp { keycode: Some(Keycode::Space), .. } => is_jump_key_down = false,
                 Event::MouseButtonDown { mouse_btn: MouseButton::Left, x, y, .. }  => button.check_for_click((x, y)),
@@ -183,40 +248,18 @@ fn main() -> Result<(), String> {
             }
         }
 
-        player.bounding_box.y += ((player.frames_falling as f32 / 5f32 + 2f32).powi(2) / 28f32) as i32 - 3;
-        if player.y() > SCREEN_HEIGHT - GROUND_HEIGHT - player.height() as i32 {
-            player.is_dead = true;
-            break 'running;
-        }
-
-        // Draw background
         canvas.set_draw_color(Color::RGB(125, 125, 255));
         canvas.clear();
-        // Draw and update pipes
-        for pipe in pipes.iter_mut() {
-            pipe.bounding_box.x -= 1 + frames / 900;
-            if player.bounding_box.has_intersection(Rect::new(pipe.x(), pipe.hole_y + HOLE_HEIGHT as i32, pipe.width(), SCREEN_HEIGHT - GROUND_HEIGHT - (pipe.hole_y as u32 + HOLE_HEIGHT))) || player.bounding_box.has_intersection(Rect::new(pipe.x(), 0, pipe.width(), pipe.hole_y as u32)) {
-                player.is_dead = true;
-                break 'running;
-            }
-            if !pipe.has_scored && pipe.has_intersection(*player) {
-                score += 1;
-                pipe.has_scored = true;
-            }
-            if pipe.x() < -200 {
-                pipe.bounding_box.x = 1000;
-                pipe.hole_y = Pipe::generate_hole();
-                pipe.has_scored = false;
-            }
+
+        for pipe in pipes.iter() {
             pipe.draw(&mut canvas)?;
         }
         
-        // Draw bird
         player.draw(&mut canvas)?;
-        // Draw floor
+
         canvas.set_draw_color(Color::RGB(125, 255, 125));
         canvas.fill_rect(Rect::new(0, SCREEN_HEIGHT as i32 - GROUND_HEIGHT as i32, SCREEN_WIDTH, GROUND_HEIGHT))?;
-        // Draw score
+
         let font_surface = font.render(&format!("{score}"))
                                 .blended(Color::RGB(0, 0, 0))
                                 .map_err(|e| e.to_string())?;
@@ -229,8 +272,8 @@ fn main() -> Result<(), String> {
 
         thread::sleep(Duration::from_millis(1000/60));
         frames += 1;
-        player.frames_falling += 1;
     }
 
     Ok(())
 }
+
